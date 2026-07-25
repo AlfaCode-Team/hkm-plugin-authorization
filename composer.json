@@ -1,0 +1,15 @@
+{
+    "name": "alfacode-team/hkm-plugin-authorization",
+    "description": "HKM Kernel plugin providing 'authorization.policy'.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["hkm-kernel", "plugin", "php", "authorization.policy"],
+    "require": {
+        "php": ">=8.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "Plugins\\Authorization\\": ""
+        }
+    }
+}
