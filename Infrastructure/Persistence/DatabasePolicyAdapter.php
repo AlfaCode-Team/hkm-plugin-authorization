@@ -80,6 +80,21 @@ final class DatabasePolicyAdapter implements Adapter, BatchAdapter, FilteredAdap
 
     public function savePolicy(Model $model): void
     {
+        // ATOMIC. This truncated the whole rule table and then re-inserted
+        // row by row. A failure part-way through — a lost connection, a bad
+        // row, the process being killed — left authorization EMPTY or partial.
+        //
+        // Because the enforcer is fail-closed, an empty policy table denies
+        // everything: a total lockout of every user including the
+        // administrators who would have to fix it. Wrapping the delete and the
+        // re-insert in one transaction makes the swap all-or-nothing, so a
+        // failure leaves the previous policy intact.
+        $ownsTransaction = !$this->db->inTransaction();
+
+        if ($ownsTransaction) {
+            $this->db->beginTransaction();
+        }
+
         try {
             $this->db->execute("DELETE FROM {$this->table}");
 
@@ -93,7 +108,15 @@ final class DatabasePolicyAdapter implements Adapter, BatchAdapter, FilteredAdap
                     $this->insertRow($ptype, $rule);
                 }
             }
-        } catch (\PDOException $e) {
+
+            if ($ownsTransaction) {
+                $this->db->commit();
+            }
+        } catch (\Throwable $e) {
+            if ($ownsTransaction) {
+                $this->db->rollback();
+            }
+
             throw new RepositoryException('Failed to save Casbin policy', layer: 'repository.authorization', previous: $e);
         }
     }

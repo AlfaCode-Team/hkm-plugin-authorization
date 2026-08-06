@@ -76,3 +76,19 @@ if (!function_exists('replaceEvalWithMappings')) {
         );
     }
 }
+
+if (!function_exists('array_uniqueness')) {
+    /**
+     * De-duplicate a list, preserving order and re-indexing.
+     *
+     * Engine/RBAC/Role.php calls this, but nothing in the repository defined
+     * it — so any code path reaching Role::getRoles() (which
+     * AuthorizationService::rolesOf() does) fataled with "undefined function".
+     * It was part of the old framework's lazily-included Casbin helpers and was
+     * missed when the engine was ported.
+     */
+    function array_uniqueness(array $values): array
+    {
+        return array_values(array_unique($values));
+    }
+}
