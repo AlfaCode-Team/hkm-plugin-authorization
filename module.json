@@ -1,11 +1,12 @@
 {
     "name": "authorization",
-    "version": "1.0.4",
+    "version": "1.1.0",
     "kernel": "^1.13.1",
     "solves": "authorization.policy",
     "type": "module",
 
-    "requires": ["database.management"],
+    "requires": ["database.management", "i18n.translation"],
+    "lang": { "path": "resources/lang", "namespace": "authorization", "global": false },
     "exposes": ["Plugins\\Authorization\\API\\Contracts\\AuthorizationServiceContract"],
 
     "routes": [],

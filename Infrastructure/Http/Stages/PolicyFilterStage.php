@@ -39,7 +39,7 @@ final class PolicyFilterStage implements HttpStageContract
 
         $identity = $request->identity();
         if ($identity === null || $identity->isGuest()) {
-            return Response::unauthorized('Authentication required.');
+            return Response::unauthorized(trans_or('authorization::messages.auth.required', 'Authentication is required.'));
         }
 
         $container = $request->container();
@@ -48,14 +48,14 @@ final class PolicyFilterStage implements HttpStageContract
             // incomplete (missing "requires": ["authorization.policy"]).
             return Response::json(['error' => [
                 'code'    => 'authorization.unavailable',
-                'message' => 'This route declares a policy filter but the authorization module is not loaded.',
+                'message' => trans_or('authorization::messages.policy.not_loaded', 'This route declares a policy filter but the authorization module is not loaded.'),
             ]], 500);
         }
 
         $authz = $container->make(AuthorizationServiceContract::class);
         if (!$authz instanceof AuthorizationServiceContract
             || !$authz->allows($identity->userId, $object, $action)) {
-            return Response::forbidden('You are not allowed to perform this action.');
+            return Response::forbidden(trans_or('authorization::messages.policy.forbidden', 'You are not allowed to perform this action.'));
         }
 
         return $next($request);
