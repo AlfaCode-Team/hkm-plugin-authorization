@@ -1,6 +1,6 @@
 {
     "name": "authorization",
-    "version": "1.1.1",
+    "version": "1.2.0",
     "kernel": "^1.13.1",
     "solves": "authorization.policy",
     "type": "module",
@@ -15,6 +15,7 @@
 
     "config": [
         { "key": "AUTHZ_MODEL_PATH",   "type": "string", "required": false },
-        { "key": "AUTHZ_POLICY_TABLE", "type": "string", "required": false }
+        { "key": "AUTHZ_POLICY_TABLE", "type": "string", "required": false },
+        { "key": "AUTHZ_POLICY_FILE",  "type": "string", "required": false }
     ]
 }

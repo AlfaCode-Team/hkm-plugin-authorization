@@ -7,6 +7,7 @@ namespace Plugins\Authorization\Application\Services;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Exceptions\ServiceException;
 use Plugins\Authorization\API\Contracts\AuthorizationServiceContract;
 use Plugins\Authorization\Engine\Enforcer;
+use Plugins\Authorization\Engine\Persist\Adapters\FileAdapter;
 
 /**
  * GDA service wrapping the Casbin Enforcer.
@@ -79,7 +80,16 @@ final class AuthorizationService implements AuthorizationServiceContract
         );
     }
 
-    /** True when the model's role definition carries a third (domain) token. */
+    /**
+     * True when the model's role definition carries a third (domain) token.
+     *
+     * `$model['g']['g']`, NOT `$model->model['g']['g']`: Model extends Policy,
+     * which keeps its assertions in a PROTECTED `$items` exposed through
+     * ArrayAccess. There is no `model` property, so the old expression was
+     * always null — the count was 0 and this returned false for EVERY model,
+     * including the domain-aware one. Every domain-scoped call was refused no
+     * matter how the plugin was configured.
+     */
     private function modelSupportsDomains(): bool
     {
         if ($this->domainsSupported !== null) {
@@ -87,8 +97,7 @@ final class AuthorizationService implements AuthorizationServiceContract
         }
 
         try {
-            $model  = $this->enforcer->getModel();
-            $tokens = $model->model['g']['g']->tokens ?? [];
+            $tokens = $this->enforcer->getModel()['g']['g']->tokens ?? [];
 
             return $this->domainsSupported = \count($tokens) >= 3;
         } catch (\Throwable) {
@@ -98,9 +107,98 @@ final class AuthorizationService implements AuthorizationServiceContract
         }
     }
 
+    /**
+     * Refuse a WRITE when the policy store cannot accept one.
+     *
+     * With AUTHZ_POLICY_FILE set the enforcer runs on Casbin's FileAdapter,
+     * whose addPolicy/removePolicy throw NotImplementedException. Letting that
+     * escape would put a vendor exception through the service boundary and tell
+     * the caller nothing about why; this names the cause and the fix instead.
+     *
+     * Checked up front rather than caught afterwards so nothing is half-applied
+     * — assignRole and grant both reach the enforcer more than once.
+     */
+    private function assertWritable(string $operation): void
+    {
+        if (!$this->readOnly()) {
+            return;
+        }
+
+        throw new ServiceException(
+            'authorization.store.read_only',
+            layer: 'service.authorization',
+            context: [
+                'operation' => $operation,
+                'hint'      => 'The policy store is a FILE (AUTHZ_POLICY_FILE), which Casbin '
+                             . 'cannot write rule-by-rule. Edit the CSV and redeploy, or unset '
+                             . 'AUTHZ_POLICY_FILE to use the policy table.',
+            ],
+        );
+    }
+
+    /** Memoised: whether the active adapter rejects per-rule writes. */
+    private ?bool $readOnly = null;
+
+    private function readOnly(): bool
+    {
+        if ($this->readOnly !== null) {
+            return $this->readOnly;
+        }
+
+        try {
+            return $this->readOnly = $this->enforcer->getAdapter() instanceof FileAdapter;
+        } catch (\Throwable) {
+            // Cannot tell — assume writable, so a working deployment is never
+            // refused a write it could have performed. A genuinely read-only
+            // adapter still raises from the engine.
+            return $this->readOnly = false;
+        }
+    }
+
+    /** Memoised: [objectIndex, actionIndex] within a policy rule. */
+    private ?array $policyColumns = null;
+
+    /**
+     * Where the object and action actually sit in a policy rule.
+     *
+     * The rule is a positional list shaped by the model's policy_definition, so
+     * `p = sub, obj, act` puts them at 1 and 2 while `p = sub, dom, obj, act`
+     * puts them at 2 and 3. This used to be hardcoded to 1 and 2, which under a
+     * domain-aware model returned "<domain>:<object>" — `p, admin, *, tenancy,
+     * admin` came back as the permission "*:tenancy" instead of "tenancy:admin".
+     *
+     * The tokens are NAMED (p_sub, p_dom, p_obj, p_act), so the positions are
+     * looked up rather than assumed, and any policy_definition works — including
+     * ones this plugin does not ship. The 1/2 fallback is for a model whose
+     * tokens cannot be read at all.
+     *
+     * @return array{0: int, 1: int}
+     */
+    private function policyColumns(): array
+    {
+        if ($this->policyColumns !== null) {
+            return $this->policyColumns;
+        }
+
+        try {
+            $tokens = $this->enforcer->getModel()['p']['p']->tokens ?? [];
+        } catch (\Throwable) {
+            $tokens = [];
+        }
+
+        $objectAt = array_search('p_obj', $tokens, true);
+        $actionAt = array_search('p_act', $tokens, true);
+
+        return $this->policyColumns = [
+            \is_int($objectAt) ? $objectAt : 1,
+            \is_int($actionAt) ? $actionAt : 2,
+        ];
+    }
+
     public function assignRole(string $user, string $role, ?string $domain = null): bool
     {
         $this->assertDomainsSupported($domain, 'assignRole');
+        $this->assertWritable('assignRole');
 
         return $domain === null
             ? $this->enforcer->addRoleForUser($user, $role)
@@ -110,6 +208,7 @@ final class AuthorizationService implements AuthorizationServiceContract
     public function revokeRole(string $user, string $role, ?string $domain = null): bool
     {
         $this->assertDomainsSupported($domain, 'revokeRole');
+        $this->assertWritable('revokeRole');
 
         return $domain === null
             ? $this->enforcer->deleteRoleForUser($user, $role)
@@ -126,7 +225,19 @@ final class AuthorizationService implements AuthorizationServiceContract
             : $this->enforcer->getRolesForUserInDomain($user, $domain);
     }
 
-    /** @return list<string> effective (own + role-inherited) "object:action" grants */
+    /**
+     * Effective (own + role-inherited) "object:action" grants.
+     *
+     * CAVEAT, measured: when a DOMAIN is passed, the engine's
+     * getImplicitPermissionsForUser() selects policies whose domain equals it
+     * exactly. A policy written with `*` — which the MATCHER honours, so
+     * allows() returns true for it — is skipped here. The list therefore
+     * under-reports globally-scoped permissions rather than over-reporting
+     * them, which is the safe direction for something that is displayed rather
+     * than enforced. allows() remains the authority on what a subject may do.
+     *
+     * @return list<string>
+     */
     public function permissionsOf(string $user, ?string $domain = null): array
     {
         $this->assertDomainsSupported($domain, 'permissionsOf');
@@ -135,11 +246,12 @@ final class AuthorizationService implements AuthorizationServiceContract
             ? $this->enforcer->getImplicitPermissionsForUser($user)
             : $this->enforcer->getImplicitPermissionsForUser($user, $domain);
 
+        [$objectAt, $actionAt] = $this->policyColumns();
+
         $permissions = [];
         foreach ($rules as $rule) {
-            // Rule shape: [sub, obj, act] (+ optional extras) — flatten to obj:act.
-            $object = (string) ($rule[1] ?? '');
-            $action = (string) ($rule[2] ?? '');
+            $object = (string) ($rule[$objectAt] ?? '');
+            $action = (string) ($rule[$actionAt] ?? '');
             if ($object !== '' && $action !== '') {
                 $permissions[$object . ':' . $action] = true;
             }
@@ -150,11 +262,15 @@ final class AuthorizationService implements AuthorizationServiceContract
 
     public function grant(string $subject, string $object, string $action, string ...$extra): bool
     {
+        $this->assertWritable('grant');
+
         return $this->enforcer->addPolicy($subject, $object, $action, ...$extra);
     }
 
     public function revoke(string $subject, string $object, string $action, string ...$extra): bool
     {
+        $this->assertWritable('revoke');
+
         return $this->enforcer->removePolicy($subject, $object, $action, ...$extra);
     }
 }

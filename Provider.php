@@ -58,10 +58,39 @@ final class Provider implements ModuleContract
             )
         );
 
-        // The Casbin Enforcer — internal, built from the model config + DB adapter.
+        // The Casbin Enforcer — internal, built from the model config plus ONE of
+        // two policy sources.
+        //
+        // AUTHZ_POLICY_FILE selects a CSV on disk instead of the policy table,
+        // for deployments that want roles and permissions to live in version
+        // control and ship with the release rather than be edited at runtime.
+        // CoreEnforcer treats a string adapter as a file path (initWithFile), so
+        // the model and the policy are both files in that mode.
+        //
+        // It is READ-ONLY, and deliberately so: Casbin's FileAdapter implements
+        // loadPolicy and savePolicy but throws NotImplementedException from
+        // addPolicy/removePolicy. AuthorizationService turns an attempted write
+        // into a clear ServiceException rather than letting that escape — see
+        // its assertWritable().
         $container->bindInternal(Enforcer::class, static function (ModuleContainer $c) {
-            $modelPath = env('AUTHZ_MODEL_PATH') ?: __DIR__ . '/config/rbac_model.conf';
-            return new Enforcer($modelPath, $c->make(DatabasePolicyAdapter::class));
+            $modelPath  = env('AUTHZ_MODEL_PATH') ?: __DIR__ . '/config/rbac_model.conf';
+            $policyFile = trim((string) (env('AUTHZ_POLICY_FILE') ?: ''));
+
+            if ($policyFile === '') {
+                return new Enforcer($modelPath, $c->make(DatabasePolicyAdapter::class));
+            }
+
+            // Fail here rather than boot with an EMPTY policy. A mistyped path
+            // would otherwise deny everything at runtime, which reads like a
+            // permissions bug and not like a missing file.
+            if (!is_file($policyFile) || !is_readable($policyFile)) {
+                throw new \RuntimeException(
+                    "AUTHZ_POLICY_FILE [{$policyFile}] is not a readable file. "
+                    . 'Unset it to use the policy table, or correct the path.',
+                );
+            }
+
+            return new Enforcer($modelPath, $policyFile);
         });
 
         // Published contract.

@@ -23,6 +23,18 @@ use Plugins\Authorization\API\Contracts\AuthorizationServiceContract;
  * Casbin policy. FAIL-CLOSED: a guest, a missing enforcer (the route forgot to
  * require authorization.policy), or a deny all yield an error response —
  * never a pass-through.
+ *
+ * ── DOMAIN ──────────────────────────────────────────────────────────────────
+ * Under a domain-aware model the request definition is `r = sub, dom, obj, act`,
+ * so a three-argument enforce is one value short and the matcher evaluates
+ * against a request it was not written for. The tenant on the Identity is the
+ * domain, and it is passed ONLY when the loaded model actually declares one —
+ * appending it to a domain-less request would be the mirror mistake.
+ *
+ * The capability question is asked of the SERVICE rather than answered here:
+ * `rolesOf()` is refused with `authorization.domain.unsupported` when the model
+ * cannot carry a domain, so one throwaway read against a subject that cannot
+ * exist settles it, once per request.
  */
 final class PolicyFilterStage implements HttpStageContract
 {
@@ -53,11 +65,48 @@ final class PolicyFilterStage implements HttpStageContract
         }
 
         $authz = $container->make(AuthorizationServiceContract::class);
-        if (!$authz instanceof AuthorizationServiceContract
-            || !$authz->allows($identity->userId, $object, $action)) {
+
+        if (!$authz instanceof AuthorizationServiceContract || !$this->allows($authz, $identity, $object, $action)) {
             return Response::forbidden(trans_or('authorization::messages.policy.forbidden', 'You are not allowed to perform this action.'));
         }
 
         return $next($request);
+    }
+
+    /**
+     * Enforce with the domain when the model has one, without when it does not.
+     *
+     * Any failure is a DENY: this filter is fail-closed, and an enforcer that
+     * cannot answer must not be read as an allow.
+     */
+    private function allows(
+        AuthorizationServiceContract $authz,
+        \AlfacodeTeam\PhpServicePlatform\Kernel\Security\Identity $identity,
+        string $object,
+        string $action,
+    ): bool {
+        $domain = $identity->tenantId;
+
+        try {
+            if ($domain !== '' && $this->domainAware($authz, $domain)) {
+                return $authz->allows($identity->userId, $domain, $object, $action);
+            }
+
+            return $authz->allows($identity->userId, $object, $action);
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /** One read against a subject no account can hold; the service refuses if the model is domain-less. */
+    private function domainAware(AuthorizationServiceContract $authz, string $domain): bool
+    {
+        try {
+            $authz->rolesOf('__can_filter_probe__', $domain);
+
+            return true;
+        } catch (\Throwable) {
+            return false;
+        }
     }
 }
