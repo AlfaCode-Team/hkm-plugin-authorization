@@ -12,7 +12,9 @@ use AlfacodeTeam\PhpServicePlatform\Kernel\Pipelines\Http\HttpPipeline;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Pipelines\Worker\WorkerPipeline;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Ports\DatabasePort;
 use Plugins\Authorization\API\Contracts\AuthorizationServiceContract;
+use Plugins\Authorization\API\Contracts\SubjectAuthorizationContract;
 use Plugins\Authorization\Application\Services\AuthorizationService;
+use Plugins\Authorization\Application\Services\SubjectAuthorizationService;
 use Plugins\Authorization\Engine\Enforcer;
 use Plugins\Authorization\Infrastructure\Persistence\DatabasePolicyAdapter;
 use Plugins\Database\API\Contracts\DatabaseConnectionManagerContract;
@@ -42,7 +44,7 @@ final class Provider implements ModuleContract
     /** @return list<class-string> */
     public function exposes(): array
     {
-        return [AuthorizationServiceContract::class];
+        return [AuthorizationServiceContract::class, SubjectAuthorizationContract::class];
     }
 
     public function register(ModuleContainer $container): void
@@ -73,8 +75,8 @@ final class Provider implements ModuleContract
         // into a clear ServiceException rather than letting that escape — see
         // its assertWritable().
         $container->bindInternal(Enforcer::class, static function (ModuleContainer $c) {
-            $modelPath  = env('AUTHZ_MODEL_PATH') ?: __DIR__ . '/config/rbac_model.conf';
-            $policyFile = trim((string) (env('AUTHZ_POLICY_FILE') ?: ''));
+            $modelPath  = self::modelPath();
+            $policyFile = self::projectPath((string) (env('AUTHZ_POLICY_FILE') ?: ''));
 
             if ($policyFile === '') {
                 return new Enforcer($modelPath, $c->make(DatabasePolicyAdapter::class));
@@ -96,6 +98,12 @@ final class Provider implements ModuleContract
         // Published contract.
         $container->bind(AuthorizationServiceContract::class, static fn(ModuleContainer $c) =>
             new AuthorizationService($c->make(Enforcer::class))
+        );
+
+        // Published: what a project-resolved Subject's roles allow. Same
+        // enforcer, so the same policy source (table or AUTHZ_POLICY_FILE).
+        $container->bind(SubjectAuthorizationContract::class, static fn(ModuleContainer $c) =>
+            new SubjectAuthorizationService($c->make(Enforcer::class))
         );
     }
 
@@ -122,10 +130,7 @@ final class Provider implements ModuleContract
                     env('AUTHZ_POLICY_TABLE') ?: 'casbin_rule',
                 );
 
-                return new Enforcer(
-                    env('AUTHZ_MODEL_PATH') ?: __DIR__ . '/config/rbac_model.conf',
-                    $adapter,
-                );
+                return new Enforcer(self::modelPath(), $adapter);
             };
 
             $cli->command(new \Plugins\Authorization\Infrastructure\Cli\SeedPolicyCommand(
@@ -133,5 +138,31 @@ final class Provider implements ModuleContract
                 __DIR__ . '/config/policy.seed.csv',
             ));
         });
+    }
+
+    /** AUTHZ_MODEL_PATH, or the bundled domain-less model. */
+    private static function modelPath(): string
+    {
+        return self::projectPath((string) (env('AUTHZ_MODEL_PATH') ?: '')) ?: __DIR__ . '/config/rbac_model.conf';
+    }
+
+    /**
+     * A configured path, with a RELATIVE one resolved against the project root.
+     *
+     * `AUTHZ_POLICY_FILE=config/policy.csv` is the natural way to write it, and
+     * left as-is it would resolve against the process's working directory —
+     * the project root under the CLI, `public/` or `/` under PHP-FPM, wherever
+     * `php -S` was started. The same .env would then find the file in one
+     * runtime and fail the boot in another.
+     */
+    private static function projectPath(string $path): string
+    {
+        $path = trim($path);
+
+        if ($path === '' || str_starts_with($path, '/') || preg_match('#^[A-Za-z]:[\\\\/]#', $path) === 1) {
+            return $path;
+        }
+
+        return \AlfacodeTeam\PhpServicePlatform\Kernel\Support\Paths::project($path);
     }
 }

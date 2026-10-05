@@ -38,6 +38,11 @@ Points the enforcer at a CSV, so roles and permissions live in version control
 and ship with the release. The model is already a file; this makes the policy
 one too.
 
+A relative path (`AUTHZ_POLICY_FILE=config/authz/policy.csv`) is resolved
+against the project root, not the process's working directory, so the same
+`.env` works under the CLI, PHP-FPM and `php -S`. `AUTHZ_MODEL_PATH` is resolved
+the same way.
+
 **That store is read-only, and the plugin says so rather than pretending.**
 Casbin's `FileAdapter` throws `NotImplementedException` from
 `addPolicy`/`removePolicy`, and `InternalEnforcer` swallows it in an empty
@@ -49,6 +54,88 @@ front with `authorization.store.read_only`. Reads are unaffected.
 A path that does not resolve fails at bind time, rather than booting with an
 empty policy that denies everything — which reads like an authorization bug
 instead of a missing file.
+
+### Roles from your application (`SubjectResolverContract`)
+
+Most applications already know who holds which role — a membership table, a
+`user_tenants.role` column. Copying that into `g` rows makes two stores that
+must change together, and a role removed from one but not the other keeps
+working. Since 1.3.0 the `can` filter can ask the application instead.
+
+Bind a resolver from one of your modules (an essential one, so it is loaded on
+every request that runs the filter):
+
+```php
+use Plugins\Authorization\API\Contracts\SubjectResolverContract;
+use Plugins\Authorization\API\Subject;
+
+$container->bind(SubjectResolverContract::class, fn ($c) => new class (/* … */) implements SubjectResolverContract {
+    public function resolve(Request $request): ?Subject
+    {
+        // who, which roles they hold HERE (read live), and where "here" is
+        return new Subject($userId, [$seatRole], $tenantId);
+    }
+});
+```
+
+The filter then checks the policy for those **roles**, so the policy only has to
+say what a role may do:
+
+```csv
+p, owner,   *,        *
+p, finance, payments, read
+p, finance, payments, refund
+g, admin,   owner
+```
+
+| The resolver returns | The filter |
+|---|---|
+| a `Subject` with roles | allows when any role is granted the route's `can:object,action` |
+| a `Subject` with no roles | refuses — `DenialReason::NoRole` |
+| `null` | does what it did before 1.3.0: judges `Identity->userId` against the store's `g` rows |
+| throws | nothing is caught — the request fails as a server error, which still refuses it |
+
+The resolved subject is attached to the request as `Subject::ATTRIBUTE`
+(`authz.subject`), so a handler can ask more questions about the same person
+without resolving them again. `SubjectAuthorizationContract` answers them:
+
+```php
+$authz->allows($subject, 'payments', 'refund');                    // one check
+$authz->filter($subject, ['payments:refund', 'reports:download']); // which of these they hold
+```
+
+`filter()` asks the matcher about each permission, so wildcard rows expand
+correctly (`p, owner, *, *` answers `payments:refund`), which a listing such as
+`permissionsOf()` cannot do. Use it to decide which menu items and buttons to show.
+
+The resolver also decides where the person is judged. Without one that is
+`Identity->tenantId`, a hint the kernel does not vouch for. An application that
+judges, for example, against the tenant that owns the hostname does that lookup
+in its resolver. Under the domain-aware model the subject's `domain` is matched
+against `p.dom`. Under the default model it is ignored, because the roles were
+already looked up there.
+
+### What a refusal looks like (`DenialResponderContract`)
+
+The default refusal is a 401/403 with the standard error envelope, which suits
+an API. A page someone opened in a browser usually needs something else: a page
+that explains, or a redirect to the part of the application they can use. Bind
+a `DenialResponderContract` to decide:
+
+```php
+public function respond(Request $request, Denial $denial): ?Response
+{
+    return match ($denial->reason) {
+        DenialReason::NoRole    => Response::redirect('/elsewhere'),
+        DenialReason::Forbidden => $this->noAccessPage($denial->permission()),
+        default                 => null,   // the standard 401/403
+    };
+}
+```
+
+It controls only how the refusal looks: the request has already been refused,
+and nothing it returns reaches the route's handler. Configuration faults (a
+malformed `can:` declaration, or the module not loaded) are never passed to it.
 
 ### Known limits of the domain-aware model
 
